@@ -5,3 +5,4 @@ protobuf
 pycryptodome
 protobuf_decoder
 redis
+gunicorn
