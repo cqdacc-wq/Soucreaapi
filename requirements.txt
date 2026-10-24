@@ -4,3 +4,4 @@ requests
 protobuf
 pycryptodome
 protobuf_decoder
+redis
