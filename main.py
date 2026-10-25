@@ -523,8 +523,7 @@ async def fetch_player_info(uid_num, session, _retry=0):
     if not tok:
         await refresh_info_token()
         tok = get_info_token()
-    if not tok:
-        return None
+    if not tok: return None
 
     proto = b"\x08" + encode_varint(int(uid_num)) + b"\x10\x09\x18\x01\x20\x01"
     payload = aes_encrypt(proto)
@@ -607,15 +606,12 @@ async def process_send_likes(target_uid_str, target_likes=200):
         total_sent = 0
 
         try:
-            # giảm 5 -> 3 vòng để tránh timeout Render free 100s
-            for _ in range(3):
-                if likes_added >= target_likes or not used:
-                    break
+            # gửi thẳng, không sleep, chạy tới khi đủ like hoặc hết token
+            while likes_added < target_likes and used:
                 batch = used[: target_likes]
                 total_sent += len(batch)
-                tasks = [send_single_like(payload, t, session, i * 0.003) for i, t in enumerate(batch)]
+                tasks = [send_single_like(payload, t, session, 0) for t in batch]
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await asyncio.sleep(0.3)
                 info_after = await fetch_player_info(int(target_uid_str), session)
                 if info_after and "likes" in info_after:
                     likes_added = int(info_after["likes"]) - before
