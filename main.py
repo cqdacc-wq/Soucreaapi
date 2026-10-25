@@ -38,10 +38,10 @@ _mem = {
 }
 
 # ================== CONFIG ==================
-INFO_ACCOUNT = {
-    "uid": "7905431498",
-    "password": "E1C3A316E3A3BEFA1DC8"
-}
+# Account "info" dùng để gọi GetPlayerPersonalShow / LikeProfile.
+# KHÔNG hard-code: lấy từ acc.json.
+# Nếu set env INFO_UID và UID đó có trong acc.json -> ưu tiên dùng.
+INFO_UID_ENV = os.environ.get("INFO_UID", "").strip()
 
 if sys.platform.startswith('win'):
     try:
@@ -110,6 +110,16 @@ def get_next_reset_seconds():
         return 0
     return max(0, int(RESET_INTERVAL - (time.time() - last)))
 
+# --- active info account uid ---
+def get_active_info_uid():
+    return str(_load_state().get("active_info_uid", "") or "")
+
+def set_active_info_uid(uid):
+    s = _load_state(); s["active_info_uid"] = str(uid); _save_state(s)
+
+def clear_active_info_uid():
+    s = _load_state(); s.pop("active_info_uid", None); _save_state(s)
+
 # ================== INFO TOKEN ==================
 def get_info_token():
     r = get_redis()
@@ -129,6 +139,16 @@ def save_info_token(tok):
         except Exception:
             pass
     _mem["info_token"] = tok
+
+def invalidate_info_token():
+    r = get_redis()
+    if r:
+        try:
+            r.delete("app:info_token")
+            return
+        except Exception:
+            pass
+    _mem["info_token"] = None
 
 # ================== TOKENS ==================
 def load_tokens():
@@ -196,6 +216,7 @@ def is_dabuff(uid):
 
 # ================== FILE ACC ==================
 def load_acc():
+    """acc.json: {uid: password}"""
     try:
         with open(ACC_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -215,6 +236,23 @@ def decode_jwt_uid(token):
     except Exception:
         pass
     return ""
+
+# ================== INFO ACCOUNT (từ acc.json) ==================
+def get_info_account_candidates():
+    """Danh sách (uid, password) để dùng làm account info.
+    - Nếu INFO_UID_ENV có trong acc.json -> đứng đầu.
+    - Sau đó là toàn bộ account còn lại trong acc.json.
+    """
+    accs = load_acc()
+    if not accs:
+        return []
+    items = []
+    if INFO_UID_ENV and INFO_UID_ENV in accs:
+        items.append((INFO_UID_ENV, accs[INFO_UID_ENV]))
+    for uid, pwd in accs.items():
+        if uid not in [u for u, _ in items]:
+            items.append((uid, pwd))
+    return items
 
 # ================== PROTOBUF HELPERS ==================
 def encode_varint(value):
@@ -363,14 +401,37 @@ async def login_single_account(uid, password, session, delay=0.0):
         return uid, None
 
 async def refresh_info_token():
-    timeout = aiohttp.ClientTimeout(total=30)
+    """Thử login lần lượt các account trong acc.json để lấy token info.
+    - Ưu tiên account đang active (nếu còn) -> nếu fail thì đổi account khác.
+    - Lưu UID thành công vào state để lần sau dùng tiếp.
+    Trả về True nếu lấy được token.
+    """
+    candidates = get_info_account_candidates()
+    if not candidates:
+        print("[InfoToken] acc.json rỗng, không thể lấy account info")
+        return False
+
+    active_uid = get_active_info_uid()
+    # đưa account đang active lên đầu danh sách thử
+    if active_uid:
+        candidates.sort(key=lambda x: 0 if x[0] == active_uid else 1)
+
+    timeout = aiohttp.ClientTimeout(total=60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for _ in range(2):
-            _, jwt = await login_single_account(INFO_ACCOUNT["uid"], INFO_ACCOUNT["password"], session)
-            if jwt:
-                save_info_token(jwt)
-                return True
-            await asyncio.sleep(5)
+        for uid, pwd in candidates:
+            # thử tối đa 2 lần cho mỗi account
+            for attempt in range(2):
+                _, jwt = await login_single_account(uid, pwd, session)
+                if jwt:
+                    save_info_token(jwt)
+                    set_active_info_uid(uid)
+                    print(f"[InfoToken] OK bằng account {uid}")
+                    return True
+                await asyncio.sleep(1)
+            # account này die -> log và thử account kế
+            print(f"[InfoToken] account {uid} die, thử account khác...")
+
+    print("[InfoToken] TẤT CẢ account trong acc.json đều die")
     return False
 
 # ================== REFRESH ALL TOKENS ==================
@@ -457,12 +518,13 @@ def auto_reset_if_due():
     return None
 
 # ================== PLAYER INFO / LIKE ==================
-async def fetch_player_info(uid_num, session):
+async def fetch_player_info(uid_num, session, _retry=0):
     tok = get_info_token()
     if not tok:
         await refresh_info_token()
         tok = get_info_token()
-    if not tok: return None
+    if not tok:
+        return None
 
     proto = b"\x08" + encode_varint(int(uid_num)) + b"\x10\x09\x18\x01\x20\x01"
     payload = aes_encrypt(proto)
@@ -483,6 +545,13 @@ async def fetch_player_info(uid_num, session):
                 b = o.basic_info
                 return {"uid": b.account_id, "nickname": b.nickname, "level": b.level,
                         "region": b.region, "likes": b.liked}
+            # token info die (401/403) -> xoá token, refresh + đổi account, retry 1 lần
+            if r.status in (401, 403) and _retry == 0:
+                print(f"[InfoToken] token die (HTTP {r.status}), đổi account info...")
+                invalidate_info_token()
+                clear_active_info_uid()
+                await refresh_info_token()
+                return await fetch_player_info(uid_num, session, _retry=1)
     except Exception:
         pass
     return None
@@ -511,6 +580,12 @@ async def process_send_likes(target_uid_str, target_likes=200):
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         info_before = await fetch_player_info(int(target_uid_str), session)
+        # nếu fail, force đổi account info 1 lần rồi fetch lại
+        if not info_before or "likes" not in info_before:
+            invalidate_info_token()
+            clear_active_info_uid()
+            await refresh_info_token()
+            info_before = await fetch_player_info(int(target_uid_str), session)
         if not info_before or "likes" not in info_before:
             return {"Failed": f"UID {target_uid_str} không tồn tại hoặc lỗi kết nối"}, 200
 
@@ -532,14 +607,15 @@ async def process_send_likes(target_uid_str, target_likes=200):
         total_sent = 0
 
         try:
-            for _ in range(5):
+            # giảm 5 -> 3 vòng để tránh timeout Render free 100s
+            for _ in range(3):
                 if likes_added >= target_likes or not used:
                     break
                 batch = used[: target_likes]
                 total_sent += len(batch)
                 tasks = [send_single_like(payload, t, session, i * 0.003) for i, t in enumerate(batch)]
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 info_after = await fetch_player_info(int(target_uid_str), session)
                 if info_after and "likes" in info_after:
                     likes_added = int(info_after["likes"]) - before
@@ -640,9 +716,13 @@ def route_status():
     db = load_dabuff()
     state = _load_state()
     last_reset = get_last_reset_ts()
+    active_uid = get_active_info_uid()
     return jsonify({
         "server_time_vn": get_now_vn().strftime("%Y-%m-%d %H:%M:%S"),
         "info_token_active": bool(get_info_token()),
+        "info_account_uid": active_uid or None,
+        "info_account_configured": INFO_UID_ENV or None,
+        "info_candidates_count": len(get_info_account_candidates()),
         "total_tokens": len(tokens),
         "min_token_count": min((v.get("count", 0) for v in tokens.values()), default=0),
         "max_token_count": max((v.get("count", 0) for v in tokens.values()), default=0),
@@ -656,6 +736,30 @@ def route_status():
         "next_6h_refresh_seconds": int(get_seconds_until_6h_refresh()),
         "last_refresh_time": state.get("last_refresh_time", 0),
         "storage": "redis" if get_redis() else "memory"
+    }), 200
+
+# ================== INFO ACCOUNT ENDPOINT ==================
+@app.route("/info/account", methods=["GET", "POST"])
+def route_info_account():
+    if request.method == "POST":
+        # force đổi: xoá token + active uid -> refresh sẽ chọn account khác
+        invalidate_info_token()
+        clear_active_info_uid()
+        try:
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            ok = loop.run_until_complete(refresh_info_token()); loop.close()
+            return jsonify({
+                "ok": ok,
+                "active_uid": get_active_info_uid() or None,
+                "token_active": bool(get_info_token())
+            }), 200
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify({
+        "active_uid": get_active_info_uid() or None,
+        "token_active": bool(get_info_token()),
+        "configured_env": INFO_UID_ENV or None,
+        "candidates_count": len(get_info_account_candidates())
     }), 200
 
 # ================== CRON ENDPOINTS ==================
@@ -691,11 +795,32 @@ def cors(resp):
     resp.headers["Access-Control-Allow-Methods"] = "GET,PUT,POST,DELETE,OPTIONS"
     return resp
 
+# ================== LAZY INIT (cho gunicorn / Render) ==================
+_first_init_done = False
+
+@app.before_request
+def _lazy_init():
+    """Lần request đầu tiên: nếu chưa có token thì refresh.
+    Tránh việc gunicorn import app không chạy __main__.
+    """
+    global _first_init_done
+    if _first_init_done:
+        return
+    _first_init_done = True
+    try:
+        if not load_tokens():
+            print("[LazyInit] chưa có token, refresh lần đầu...")
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            loop.run_until_complete(refresh_all_tokens_core()); loop.close()
+    except Exception as e:
+        print(f"[LazyInit] fail: {e}")
+
 if __name__ == "__main__":
-    # Local: refresh lần đầu
+    # Chỉ chạy khi test local bằng `python main.py`
     try:
         loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
         loop.run_until_complete(refresh_all_tokens_core()); loop.close()
     except Exception as e:
         print(f"init refresh fail: {e}")
-    app.run(host="0.0.0.0", port=3637, threaded=True, debug=False)
+    port = int(os.environ.get("PORT", 3637))
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
