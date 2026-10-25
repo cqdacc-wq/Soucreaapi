@@ -39,8 +39,8 @@ _mem = {
 
 # ================== CONFIG ==================
 INFO_ACCOUNT = {
-    "uid": "7905445297",
-    "password": "60A01CA72FE32E75E45A"
+    "uid": "7905431498",
+    "password": "E1C3A316E3A3BEFA1DC8"
 }
 
 if sys.platform.startswith('win'):
