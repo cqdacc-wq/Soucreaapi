@@ -999,31 +999,13 @@ def after_request(response):
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s, f: os._exit(0))
-    signal.signal(signal.SIGTERM, lambda s, f: os._exit(0))
-    load_all_files()
-    check_and_apply_periodic_reset()
-
-    def start_background():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(refresh_all_tokens_core())
-        loop.close()
-
-    t_bg = threading.Thread(target=start_background, daemon=True)
-    t_bg.start()
-
-    t_6h = threading.Timer(21600, trigger_6h_refresh)
-    t_6h.daemon = True
-    t_6h.start()
-
+    # Local: refresh lần đầu
     try:
-        # Sử dụng Waitress thay vì Flask mặc định để không bị treo
-        from waitress import serve
-        print("Server đang chạy tại http://0.0.0.0:20000 với Waitress...")
-        serve(app, host="0.0.0.0", port=20000, threads=100)
-    except ImportError:
-        print("Chưa cài waitress, dùng Flask mặc định (pip install waitress để chạy mượt hơn)")
-        app.run(host="0.0.0.0", port=20000, threaded=True, debug=False)
-    except (KeyboardInterrupt, SystemExit):
-        os._exit(0)
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+        loop.run_until_complete(refresh_all_tokens_core()); loop.close()
+    except Exception as e:
+        print(f"init refresh fail: {e}")
+    
+    # Đọc PORT từ môi trường (Render cấp), mặc định 3637 nếu chạy local
+    port = int(os.environ.get("PORT", 3637))
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
